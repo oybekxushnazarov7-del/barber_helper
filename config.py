@@ -29,6 +29,11 @@ def _flag(name: str, default: str = "0") -> bool:
 
 
 TZ = ZoneInfo(os.getenv("TIMEZONE", "Asia/Tashkent"))
+
+# Render / PostgreSQL ulanish manzili
+DATABASE_URL = os.getenv("DATABASE_URL", "").strip()
+
+# Zaxira uchun SQLite manzili (lokal ishlatish uchun)
 DB_PATH = os.getenv("DB_PATH", str(BASE_DIR / "barber.db"))
 
 OWNER_ID = _int("OWNER_ID", 0)

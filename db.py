@@ -1,17 +1,128 @@
 from __future__ import annotations
 
 import asyncio
-
-import aiosqlite
+from typing import Any
 
 import config
 
-_conn: aiosqlite.Connection | None = None
-lock: asyncio.Lock | None = None  # bron yaratishni ketma-ket qilish uchun
+# PostgreSQL (asyncpg) va SQLite (aiosqlite) drayverlari
+try:
+    import asyncpg
+except ImportError:
+    asyncpg = None
+
+import aiosqlite
+
+_conn: Any = None
+_is_pg: bool = False
+lock: asyncio.Lock | None = None
 
 ACTIVE = ("pending_payment", "confirmed")
 
-SCHEMA = """
+# PostgreSQL uchun Schema
+SCHEMA_PG = """
+CREATE TABLE IF NOT EXISTS shops(
+    id INTEGER PRIMARY KEY,
+    name TEXT NOT NULL,
+    address TEXT DEFAULT '',
+    phone TEXT DEFAULT '',
+    card_number TEXT DEFAULT '',
+    deposit_amount INTEGER DEFAULT 15000,
+    free_cancel_hours INTEGER DEFAULT 24,
+    slot_step INTEGER DEFAULT 30
+);
+CREATE TABLE IF NOT EXISTS staff(
+    id SERIAL PRIMARY KEY,
+    shop_id INTEGER NOT NULL,
+    tg_id BIGINT,
+    name TEXT NOT NULL,
+    role TEXT NOT NULL CHECK(role IN ('owner','barber')),
+    active INTEGER DEFAULT 1,
+    invite_code TEXT
+);
+CREATE TABLE IF NOT EXISTS services(
+    id SERIAL PRIMARY KEY,
+    shop_id INTEGER NOT NULL,
+    name TEXT NOT NULL,
+    price INTEGER NOT NULL,
+    duration_min INTEGER NOT NULL,
+    active INTEGER DEFAULT 1
+);
+CREATE TABLE IF NOT EXISTS work_hours(
+    id SERIAL PRIMARY KEY,
+    staff_id INTEGER NOT NULL,
+    weekday INTEGER NOT NULL,
+    start_min INTEGER NOT NULL,
+    end_min INTEGER NOT NULL
+);
+CREATE TABLE IF NOT EXISTS blocked(
+    id SERIAL PRIMARY KEY,
+    staff_id INTEGER NOT NULL,
+    date TEXT NOT NULL,
+    start_min INTEGER NOT NULL,
+    end_min INTEGER NOT NULL
+);
+CREATE TABLE IF NOT EXISTS clients(
+    shop_id INTEGER NOT NULL,
+    tg_id BIGINT NOT NULL,
+    name TEXT DEFAULT '',
+    phone TEXT,
+    deposit_credit INTEGER DEFAULT 0,
+    no_show_count INTEGER DEFAULT 0,
+    blocked INTEGER DEFAULT 0,
+    PRIMARY KEY(shop_id, tg_id)
+);
+CREATE TABLE IF NOT EXISTS bookings(
+    id SERIAL PRIMARY KEY,
+    shop_id INTEGER NOT NULL,
+    client_id BIGINT NOT NULL,
+    staff_id INTEGER NOT NULL,
+    service_id INTEGER NOT NULL,
+    date TEXT NOT NULL,
+    start_min INTEGER NOT NULL,
+    duration_min INTEGER NOT NULL,
+    price INTEGER NOT NULL,
+    status TEXT NOT NULL,
+    deposit_amount INTEGER DEFAULT 0,
+    deposit_status TEXT DEFAULT 'none',
+    receipt_file_id TEXT,
+    created_at TEXT NOT NULL,
+    pay_deadline TEXT,
+    client_confirmed INTEGER DEFAULT 0,
+    rem_day_sent INTEGER DEFAULT 0,
+    rem_hour_sent INTEGER DEFAULT 0
+);
+CREATE TABLE IF NOT EXISTS reviews(
+    id SERIAL PRIMARY KEY,
+    booking_id INTEGER NOT NULL UNIQUE,
+    shop_id INTEGER NOT NULL,
+    staff_id INTEGER NOT NULL,
+    client_id BIGINT NOT NULL,
+    rating INTEGER NOT NULL,
+    comment TEXT,
+    created_at TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS waitlist(
+    id SERIAL PRIMARY KEY,
+    shop_id INTEGER NOT NULL,
+    client_id BIGINT NOT NULL,
+    staff_id INTEGER NOT NULL,
+    service_id INTEGER NOT NULL,
+    date TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    notified_at TEXT
+);
+CREATE TABLE IF NOT EXISTS used_receipts(
+    key TEXT PRIMARY KEY,
+    booking_id INTEGER
+);
+CREATE INDEX IF NOT EXISTS idx_bookings_staff_date ON bookings(staff_id, date);
+CREATE INDEX IF NOT EXISTS idx_bookings_client ON bookings(shop_id, client_id);
+CREATE INDEX IF NOT EXISTS idx_waitlist_staff_date ON waitlist(staff_id, date);
+"""
+
+# SQLite uchun Schema
+SCHEMA_SQLITE = """
 CREATE TABLE IF NOT EXISTS shops(
     id INTEGER PRIMARY KEY,
     name TEXT NOT NULL,
@@ -112,7 +223,6 @@ CREATE INDEX IF NOT EXISTS idx_bookings_client ON bookings(shop_id, client_id);
 CREATE INDEX IF NOT EXISTS idx_waitlist_staff_date ON waitlist(staff_id, date);
 """
 
-# Eski bazani yangilash: (jadval, ustun, turi)
 MIGRATIONS = [
     ("shops", "lat", "REAL"),
     ("shops", "lon", "REAL"),
@@ -140,42 +250,101 @@ LEFT JOIN clients c ON c.shop_id = b.shop_id AND c.tg_id = b.client_id
 """
 
 
+def _convert_query(sql: str) -> str:
+    """SQLite ? belgilarini PostgreSQL $1, $2 turiga moslaydi."""
+    if not _is_pg or "?" not in sql:
+        return sql
+    parts = sql.split("?")
+    res = []
+    for i, part in enumerate(parts[:-1]):
+        res.append(f"{part}${i+1}")
+    res.append(parts[-1])
+    return "".join(res)
+
+
 async def init_db() -> None:
-    global _conn, lock
+    global _conn, lock, _is_pg
     lock = asyncio.Lock()
-    _conn = await aiosqlite.connect(config.DB_PATH)
-    _conn.row_factory = aiosqlite.Row
-    await _conn.executescript(SCHEMA)
-    for table, column, ddl in MIGRATIONS:
-        cols = [r["name"] for r in await _all(f"PRAGMA table_info({table})")]
-        if column not in cols:
-            await _conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {ddl}")
-    await _conn.commit()
+
+    if getattr(config, "DATABASE_URL", None) and asyncpg:
+        _is_pg = True
+        db_url = config.DATABASE_URL
+        if db_url.startswith("postgres://"):
+            db_url = db_url.replace("postgres://", "postgresql://", 1)
+        _conn = await asyncpg.connect(db_url)
+        await _conn.execute(SCHEMA_PG)
+
+        for table, column, ddl in MIGRATIONS:
+            cols_rows = await _conn.fetch(
+                "SELECT column_name FROM information_schema.columns WHERE table_name=$1", table
+            )
+            cols = [r["column_name"] for r in cols_rows]
+            if column not in cols:
+                await _conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {ddl}")
+    else:
+        _is_pg = False
+        _conn = await aiosqlite.connect(config.DB_PATH)
+        _conn.row_factory = aiosqlite.Row
+        await _conn.executescript(SCHEMA_SQLITE)
+        for table, column, ddl in MIGRATIONS:
+            cols_rows = await _all(f"PRAGMA table_info({table})")
+            cols = [r["name"] for r in cols_rows]
+            if column not in cols:
+                await _conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {ddl}")
+        await _conn.commit()
 
 
 async def close_db() -> None:
     if _conn is not None:
-        await _conn.close()
+        if _is_pg:
+            await _conn.close()
+        else:
+            await _conn.close()
 
 
 async def _all(sql: str, params: tuple = ()) -> list[dict]:
-    async with _conn.execute(sql, params) as cur:
-        rows = await cur.fetchall()
-    return [dict(r) for r in rows]
+    sql_query = _convert_query(sql)
+    if _is_pg:
+        rows = await _conn.fetch(sql_query, *params)
+        return [dict(r) for r in rows]
+    else:
+        async with _conn.execute(sql_query, params) as cur:
+            rows = await cur.fetchall()
+        return [dict(r) for r in rows]
 
 
 async def _one(sql: str, params: tuple = ()) -> dict | None:
-    async with _conn.execute(sql, params) as cur:
-        row = await cur.fetchone()
-    return dict(row) if row else None
+    sql_query = _convert_query(sql)
+    if _is_pg:
+        row = await _conn.fetchrow(sql_query, *params)
+        return dict(row) if row else None
+    else:
+        async with _conn.execute(sql_query, params) as cur:
+            row = await cur.fetchone()
+        return dict(row) if row else None
 
 
 async def _exec(sql: str, params: tuple = ()) -> int:
-    cur = await _conn.execute(sql, params)
-    await _conn.commit()
-    last = cur.lastrowid
-    await cur.close()
-    return last
+    sql_query = _convert_query(sql)
+    if _is_pg:
+        if sql_query.strip().upper().startswith("INSERT INTO") and "RETURNING" not in sql_query.upper():
+            sql_query += " RETURNING id"
+            try:
+                val = await _conn.fetchval(sql_query, *params)
+                return val if val else 0
+            except Exception:
+                # Agar jadvalda `id` ustuni bo'lmasa
+                await _conn.execute(sql_query.rsplit(" RETURNING id", 1)[0], *params)
+                return 0
+        else:
+            res = await _conn.execute(sql_query, *params)
+            return 0
+    else:
+        cur = await _conn.execute(sql_query, params)
+        await _conn.commit()
+        last = cur.lastrowid
+        await cur.close()
+        return last or 0
 
 
 def _in(ids: list[int]) -> str:
@@ -263,7 +432,6 @@ async def ensure_owner(shop_id: int, tg_id: int) -> None:
 
 
 async def sync_owners(shop_id: int, desired: set[int]) -> None:
-    """Shop egalarini .env dagi ro'yxatga moslaydi: ro'yxatdagilar faol, qolganlar o'chiriladi (yashiriladi)."""
     rows = await _all("SELECT * FROM staff WHERE shop_id=? AND role='owner'", (shop_id,))
     seen: set[int] = set()
     for r in rows:
@@ -278,7 +446,6 @@ async def sync_owners(shop_id: int, desired: set[int]) -> None:
 
 
 async def notify_ids(shop_id: int, staff_id: int | None) -> list[int]:
-    """Egalar + (berilgan) usta Telegram ID lari."""
     rows = await _all(
         "SELECT DISTINCT tg_id FROM staff WHERE shop_id=? AND tg_id IS NOT NULL AND active=1 "
         "AND (role='owner' OR id=?)",
@@ -332,19 +499,17 @@ async def get_week_hours(staff_id: int) -> list[dict]:
 
 
 async def set_day_hours(staff_id: int, weekday: int, intervals: list[tuple[int, int]]) -> None:
-    await _conn.execute("DELETE FROM work_hours WHERE staff_id=? AND weekday=?", (staff_id, weekday))
+    await _exec("DELETE FROM work_hours WHERE staff_id=? AND weekday=?", (staff_id, weekday))
     for start, end in intervals:
-        await _conn.execute("INSERT INTO work_hours(staff_id,weekday,start_min,end_min) VALUES(?,?,?,?)",
-                            (staff_id, weekday, start, end))
-    await _conn.commit()
+        await _exec("INSERT INTO work_hours(staff_id,weekday,start_min,end_min) VALUES(?,?,?,?)",
+                    (staff_id, weekday, start, end))
 
 
 async def copy_week_hours(src_id: int, dst_id: int) -> None:
-    await _conn.execute("DELETE FROM work_hours WHERE staff_id=?", (dst_id,))
-    await _conn.execute(
+    await _exec("DELETE FROM work_hours WHERE staff_id=?", (dst_id,))
+    await _exec(
         "INSERT INTO work_hours(staff_id,weekday,start_min,end_min) "
         "SELECT ?, weekday, start_min, end_min FROM work_hours WHERE staff_id=?", (dst_id, src_id))
-    await _conn.commit()
 
 
 async def add_block(staff_id: int, date: str, start_min: int, end_min: int) -> int:
@@ -362,7 +527,7 @@ async def get_blocks(staff_id: int, date: str) -> list[dict]:
 async def upsert_client(shop_id: int, tg_id: int, name: str) -> None:
     await _exec(
         "INSERT INTO clients(shop_id,tg_id,name) VALUES(?,?,?) "
-        "ON CONFLICT(shop_id,tg_id) DO UPDATE SET name=excluded.name",
+        "ON CONFLICT(shop_id,tg_id) DO UPDATE SET name=EXCLUDED.name",
         (shop_id, tg_id, name),
     )
 
@@ -370,7 +535,9 @@ async def upsert_client(shop_id: int, tg_id: int, name: str) -> None:
 async def insert_client_full(shop_id: int, tg_id: int, name: str, phone: str | None, is_demo: int = 0,
                              lang: str | None = None) -> None:
     await _exec(
-        "INSERT OR REPLACE INTO clients(shop_id,tg_id,name,phone,is_demo,lang) VALUES(?,?,?,?,?,?)",
+        "INSERT INTO clients(shop_id,tg_id,name,phone,is_demo,lang) VALUES(?,?,?,?,?,?) "
+        "ON CONFLICT(shop_id,tg_id) DO UPDATE SET name=EXCLUDED.name, phone=EXCLUDED.phone, "
+        "is_demo=EXCLUDED.is_demo, lang=EXCLUDED.lang",
         (shop_id, tg_id, name, phone, is_demo, lang),
     )
 
@@ -401,29 +568,28 @@ async def find_client_by_phone(shop_id: int, phone: str, virtual_only: bool = Fa
     sql = "SELECT * FROM clients WHERE shop_id=? AND phone=?"
     if virtual_only:
         sql += " AND tg_id < 0 AND is_demo=0"
-    sql += " ORDER BY tg_id DESC LIMIT 1"  # haqiqiy (musbat) ID birinchi
+    sql += " ORDER BY tg_id DESC LIMIT 1"
     return await _one(sql, (shop_id, phone))
 
 
 async def merge_client(shop_id: int, old_id: int, new_id: int) -> None:
-    """Qo'lda qo'shilgan (virtual) mijozni haqiqiy Telegram mijoz bilan birlashtiradi."""
     old = await get_client(shop_id, old_id)
     if not old or old_id == new_id:
         return
     for table in ("bookings", "reviews", "waitlist"):
-        await _conn.execute(f"UPDATE {table} SET client_id=? WHERE shop_id=? AND client_id=?",
-                            (new_id, shop_id, old_id))
-    await _conn.execute(
+        await _exec(f"UPDATE {table} SET client_id=? WHERE shop_id=? AND client_id=?",
+                    (new_id, shop_id, old_id))
+    await _exec(
         "UPDATE clients SET deposit_credit = deposit_credit + ?, no_show_count = no_show_count + ? "
         "WHERE shop_id=? AND tg_id=?",
         (old["deposit_credit"], old["no_show_count"], shop_id, new_id))
-    await _conn.execute("DELETE FROM clients WHERE shop_id=? AND tg_id=?", (shop_id, old_id))
-    await _conn.commit()
+    await _exec("DELETE FROM clients WHERE shop_id=? AND tg_id=?", (shop_id, old_id))
 
 
 async def add_credit(shop_id: int, tg_id: int, delta: int) -> None:
     await _exec(
-        "UPDATE clients SET deposit_credit = MAX(0, deposit_credit + ?) WHERE shop_id=? AND tg_id=?",
+        "UPDATE clients SET deposit_credit = GREATEST(0, deposit_credit + ?) WHERE shop_id=? AND tg_id=?" if _is_pg
+        else "UPDATE clients SET deposit_credit = MAX(0, deposit_credit + ?) WHERE shop_id=? AND tg_id=?",
         (delta, shop_id, tg_id),
     )
 
@@ -472,8 +638,8 @@ async def winback_candidates(shop_id: int, newest_date: str, oldest_date: str) -
         "SELECT c.tg_id, c.name, c.lang, MAX(b.date) AS last_date FROM clients c "
         "JOIN bookings b ON b.shop_id=c.shop_id AND b.client_id=c.tg_id AND b.status='completed' "
         "WHERE c.shop_id=? AND c.tg_id>0 AND c.blocked=0 AND c.is_demo=0 "
-        "GROUP BY c.tg_id HAVING last_date <= ? AND last_date >= ? "
-        "AND (c.winback_for IS NULL OR c.winback_for != last_date)",
+        "GROUP BY c.tg_id, c.name, c.lang HAVING MAX(b.date) <= ? AND MAX(b.date) >= ? "
+        "AND (c.winback_for IS NULL OR c.winback_for != MAX(b.date))",
         (shop_id, newest_date, oldest_date))
 
 
@@ -588,8 +754,11 @@ async def report_rows(shop_id: int, d_from: str, d_to: str, staff_ids: list[int]
 # ---------- reviews ----------
 async def add_review(booking_id, shop_id, staff_id, client_id, rating, created_at, comment=None) -> int:
     return await _exec(
-        "INSERT OR REPLACE INTO reviews(booking_id,shop_id,staff_id,client_id,rating,comment,created_at) "
-        "VALUES(?,?,?,?,?,?,?)", (booking_id, shop_id, staff_id, client_id, rating, comment, created_at))
+        "INSERT INTO reviews(booking_id,shop_id,staff_id,client_id,rating,comment,created_at) "
+        "VALUES(?,?,?,?,?,?,?) ON CONFLICT(booking_id) DO UPDATE SET "
+        "rating=EXCLUDED.rating, comment=EXCLUDED.comment, created_at=EXCLUDED.created_at",
+        (booking_id, shop_id, staff_id, client_id, rating, comment, created_at),
+    )
 
 
 async def set_review_comment(booking_id: int, comment: str) -> None:
@@ -666,7 +835,10 @@ async def receipt_key_used(key: str) -> bool:
 
 
 async def mark_receipt_used(key: str, booking_id: int) -> None:
-    await _exec("INSERT OR IGNORE INTO used_receipts(key,booking_id) VALUES(?,?)", (key, booking_id))
+    await _exec(
+        "INSERT INTO used_receipts(key,booking_id) VALUES(?,?) ON CONFLICT(key) DO NOTHING",
+        (key, booking_id),
+    )
 
 
 async def unmark_receipts(booking_id: int) -> None:
@@ -683,10 +855,9 @@ async def count_demo(shop_id: int | None = None) -> int:
 
 
 async def clear_demo(shop_id: int) -> None:
-    await _conn.execute("DELETE FROM reviews WHERE booking_id IN (SELECT id FROM bookings WHERE shop_id=? AND is_demo=1)",
-                        (shop_id,))
-    await _conn.execute("DELETE FROM waitlist WHERE client_id IN (SELECT tg_id FROM clients WHERE shop_id=? AND is_demo=1) "
-                        "AND shop_id=?", (shop_id, shop_id))
-    await _conn.execute("DELETE FROM bookings WHERE shop_id=? AND is_demo=1", (shop_id,))
-    await _conn.execute("DELETE FROM clients WHERE shop_id=? AND is_demo=1", (shop_id,))
-    await _conn.commit()
+    await _exec("DELETE FROM reviews WHERE booking_id IN (SELECT id FROM bookings WHERE shop_id=? AND is_demo=1)",
+                (shop_id,))
+    await _exec("DELETE FROM waitlist WHERE client_id IN (SELECT tg_id FROM clients WHERE shop_id=? AND is_demo=1) "
+                "AND shop_id=?", (shop_id, shop_id))
+    await _exec("DELETE FROM bookings WHERE shop_id=? AND is_demo=1", (shop_id,))
+    await _exec("DELETE FROM clients WHERE shop_id=? AND is_demo=1", (shop_id,))
