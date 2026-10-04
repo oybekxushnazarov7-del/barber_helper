@@ -7,3 +7,4 @@ qrcode[pil]>=7.4
 tzdata
 flask
 gunicorn
+aiosqlite
