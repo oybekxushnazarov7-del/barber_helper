@@ -327,17 +327,24 @@ async def _one(sql: str, params: tuple = ()) -> dict | None:
 async def _exec(sql: str, params: tuple = ()) -> int:
     sql_query = _convert_query(sql)
     if _is_pg:
-        if sql_query.strip().upper().startswith("INSERT INTO") and "RETURNING" not in sql_query.upper():
+        sql_upper = sql_query.strip().upper()
+        # id ustuni bo'lmagan jadvallarda RETURNING id qo'shmaslik
+        if (
+            sql_upper.startswith("INSERT INTO") 
+            and "RETURNING" not in sql_upper 
+            and "CLIENTS" not in sql_upper 
+            and "USED_RECEIPTS" not in sql_upper
+            and "SHOPS" not in sql_upper
+        ):
             sql_query += " RETURNING id"
             try:
                 val = await _conn.fetchval(sql_query, *params)
                 return val if val else 0
             except Exception:
-                # Agar jadvalda `id` ustuni bo'lmasa
                 await _conn.execute(sql_query.rsplit(" RETURNING id", 1)[0], *params)
                 return 0
         else:
-            res = await _conn.execute(sql_query, *params)
+            await _conn.execute(sql_query, *params)
             return 0
     else:
         cur = await _conn.execute(sql_query, params)
@@ -354,7 +361,7 @@ def _in(ids: list[int]) -> str:
 # ---------- shops ----------
 async def count_shops() -> int:
     row = await _one("SELECT COUNT(*) AS n FROM shops")
-    return row["n"]
+    return row["n"] if row else 0
 
 
 async def insert_shop(shop_id, name, address, phone, card, deposit, free_cancel_hours, slot_step,
@@ -527,24 +534,36 @@ async def get_blocks(staff_id: int, date: str) -> list[dict]:
 async def upsert_client(shop_id: int, tg_id: int, name: str) -> None:
     await _exec(
         "INSERT INTO clients(shop_id,tg_id,name) VALUES(?,?,?) "
-        "ON CONFLICT(shop_id,tg_id) DO UPDATE SET name=EXCLUDED.name",
+        "ON CONFLICT(shop_id,tg_id) DO UPDATE SET "
+        "name = CASE WHEN EXCLUDED.name != '' THEN EXCLUDED.name ELSE clients.name END",
         (shop_id, tg_id, name),
     )
 
 
 async def insert_client_full(shop_id: int, tg_id: int, name: str, phone: str | None, is_demo: int = 0,
                              lang: str | None = None) -> None:
-    await _exec(
-        "INSERT INTO clients(shop_id,tg_id,name,phone,is_demo,lang) VALUES(?,?,?,?,?,?) "
-        "ON CONFLICT(shop_id,tg_id) DO UPDATE SET name=EXCLUDED.name, phone=EXCLUDED.phone, "
-        "is_demo=EXCLUDED.is_demo, lang=EXCLUDED.lang",
-        (shop_id, tg_id, name, phone, is_demo, lang),
-    )
+    if _is_pg:
+        await _exec(
+            "INSERT INTO clients(shop_id,tg_id,name,phone,is_demo,lang) VALUES(?,?,?,?,?,?) "
+            "ON CONFLICT(shop_id,tg_id) DO UPDATE SET "
+            "name = CASE WHEN EXCLUDED.name != '' THEN EXCLUDED.name ELSE clients.name END, "
+            "phone = COALESCE(EXCLUDED.phone, clients.phone), "
+            "is_demo = EXCLUDED.is_demo, "
+            "lang = COALESCE(EXCLUDED.lang, clients.lang)",
+            (shop_id, tg_id, name, phone, is_demo, lang),
+        )
+    else:
+        await _exec(
+            "INSERT INTO clients(shop_id,tg_id,name,phone,is_demo,lang) VALUES(?,?,?,?,?,?) "
+            "ON CONFLICT(shop_id,tg_id) DO UPDATE SET name=EXCLUDED.name, phone=EXCLUDED.phone, "
+            "is_demo=EXCLUDED.is_demo, lang=EXCLUDED.lang",
+            (shop_id, tg_id, name, phone, is_demo, lang),
+        )
 
 
 async def new_virtual_client_id() -> int:
     row = await _one("SELECT COALESCE(MIN(tg_id), 0) AS m FROM clients WHERE tg_id < 0")
-    return min(-1, row["m"] - 1)
+    return min(-1, row["m"] - 1) if row else -1
 
 
 async def get_client(shop_id: int, tg_id: int) -> dict | None:
@@ -623,7 +642,7 @@ async def count_completed(shop_id: int, client_id: int) -> int:
     row = await _one(
         "SELECT COUNT(*) AS n FROM bookings WHERE shop_id=? AND client_id=? AND status='completed'",
         (shop_id, client_id))
-    return row["n"]
+    return row["n"] if row else 0
 
 
 async def has_active_discounted(shop_id: int, client_id: int) -> bool:
@@ -851,7 +870,7 @@ async def count_demo(shop_id: int | None = None) -> int:
         row = await _one("SELECT COUNT(*) AS n FROM bookings WHERE is_demo=1")
     else:
         row = await _one("SELECT COUNT(*) AS n FROM bookings WHERE is_demo=1 AND shop_id=?", (shop_id,))
-    return row["n"]
+    return row["n"] if row else 0
 
 
 async def clear_demo(shop_id: int) -> None:
